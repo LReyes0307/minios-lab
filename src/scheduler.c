@@ -42,10 +42,71 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <libgen.h>
+#include <errno.h>
 
 // Estado global del scheduler
 static volatile int current_running = -1;   // índice en process_table del proceso RUNNING, -1 si ninguno
 static volatile int scheduler_active = 0;   // 1 si el scheduler está corriendo
+
+static int block_scheduler_signals(sigset_t *previous_mask) {
+    sigset_t mask;
+
+    if (sigemptyset(&mask) == -1 ||
+        sigaddset(&mask, SIGALRM) == -1 ||
+        sigaddset(&mask, SIGCHLD) == -1) {
+        return -1;
+    }
+
+    return sigprocmask(SIG_BLOCK, &mask, previous_mask);
+}
+
+static int restore_signal_mask(const sigset_t *previous_mask) {
+    return sigprocmask(SIG_SETMASK, previous_mask, NULL);
+}
+
+static int dispatch_next_process(void) {
+    while (!rq_is_empty()) {
+        int next_idx = rq_dequeue();
+        if (next_idx < 0 || next_idx >= process_count ||
+            process_table[next_idx].state != PROC_READY) {
+            continue;
+        }
+
+        pcb_t *next = &process_table[next_idx];
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+            static const char message[] = "miniOS: clock_gettime failed in scheduler handler\n";
+            write(STDERR_FILENO, message, sizeof(message) - 1);
+            rq_enqueue(next_idx);
+            current_running = -1;
+            scheduler_active = 0;
+            timer_stop();
+            return -1;
+        }
+
+        next->wait_time_ms += timespec_diff_ms(now, next->last_started);
+        next->state = PROC_RUNNING;
+        next->last_started = now;
+        if (platform_resume_process(next->pid) == -1) {
+            static const char message[] = "miniOS: failed to resume a ready process\n";
+            write(STDERR_FILENO, message, sizeof(message) - 1);
+            next->state = PROC_TERMINATED;
+            monitor_emit_terminated(next->pid, next->cpu_time_ms,
+                                    next->context_switches);
+            continue;
+        }
+
+        current_running = next_idx;
+        scheduler_active = 1;
+        timer_start();
+        return next_idx;
+    }
+
+    current_running = -1;
+    scheduler_active = 0;
+    timer_stop();
+    return -1;
+}
 
 // ============================================================
 // Helpers ya implementados — NO los modifiques
@@ -109,53 +170,151 @@ void scheduler_stop(void) {
 // proceso en estado T (stopped) justo después de crearlo.
 // ============================================================
 int scheduler_create_process(const char *path, const char *arg) {
-    // Paso 1. Validar que hay espacio en process_table.
-    //         Si process_count >= MAX_PROCESSES, imprimir error y retornar -1.
+    if (path == NULL || path[0] == '\0') {
+        fprintf(stderr, "Error: ruta del ejecutable vacía.\n");
+        return -1;
+    }
 
-    // Paso 2. Llamar fork() y guardar el resultado en una variable pid_t.
-    //         Si fork() retorna < 0, es error: perror("fork") y retornar -1.
+    char *path_copy = strdup(path);
+    if (path_copy == NULL) {
+        perror("strdup");
+        return -1;
+    }
+    const char *short_name = basename(path_copy);
 
-    // Paso 3. Si estamos en el HIJO (pid == 0):
-    //         a) Si platform_uses_ptrace() retorna verdadero, llamar platform_trace_child().
-    //            (En macOS esto es no-op; en Linux habilita ptrace.)
-    //         b) Llamar execl(path, path, arg, NULL) si arg != NULL,
-    //            o execl(path, path, NULL) si arg == NULL.
-    //         c) Si execl retorna, falló: perror("execl") y _exit(1).
+    sigset_t previous_mask;
+    if (block_scheduler_signals(&previous_mask) == -1) {
+        perror("sigprocmask");
+        free(path_copy);
+        return -1;
+    }
 
-    // Paso 4. Si estamos en el PADRE (pid > 0) Y platform_uses_ptrace() es verdadero:
-    //         a) waitpid(pid, &status, 0) para esperar el SIGTRAP post-exec.
-    //         b) Verificar WIFSTOPPED(status). Si no está detenido: matar al hijo y retornar -1.
+    int result = -1;
+    pid_t pid = -1;
+    int child_created = 0;
+    int status = 0;
 
-    // Paso 5. Crear la entrada en el PCB:
-    //         - Calcular idx = process_count (índice libre en la tabla)
-    //         - Obtener nombre corto con basename() sobre una copia de path
-    //         - Llamar pcb_init(&process_table[idx], pid, short_name)
-    //         - Liberar la copia del path
-    //
-    //         Ejemplo:
-    //             char *path_copy = strdup(path);
-    //             char *short_name = basename(path_copy);
-    //             pcb_init(&process_table[idx], pid, short_name);
-    //             free(path_copy);
+    if (process_count >= MAX_PROCESSES) {
+        fprintf(stderr, "Error: la tabla de procesos está llena.\n");
+        goto cleanup;
+    }
 
-    // Paso 6. (Solo si platform_uses_ptrace()) Intentar capturar registros iniciales:
-    //         a) Si platform_get_registers(pid, &process_table[idx].registers) retorna 0,
-    //            marcar process_table[idx].regs_valid = 1.
-    //         b) Llamar platform_detach(pid) para liberar el tracing.
+    int idx = process_count;
+    pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        goto cleanup;
+    }
 
-    // Paso 7. Detener el proceso con platform_stop_process(pid).
-    //         Si falla: perror, matar, retornar -1.
+    if (pid == 0) {
+        sigset_t child_mask = previous_mask;
+        sigdelset(&child_mask, SIGALRM);
+        sigdelset(&child_mask, SIGCHLD);
+        if (sigprocmask(SIG_SETMASK, &child_mask, NULL) == -1) {
+            perror("sigprocmask");
+            _exit(1);
+        }
 
-    // Paso 8. waitpid(pid, &status, WUNTRACED) para confirmar que se detuvo.
-    //         Si falla: perror, matar, retornar -1.
+        if (platform_uses_ptrace() && platform_trace_child() == -1) {
+            perror("platform_trace_child");
+            _exit(1);
+        }
 
-    // Paso 9. Marcar el PCB como PROC_READY, incrementar process_count,
-    //         llamar rq_enqueue(idx), emitir monitor_emit_created(pid, name)
-    //         y si regs_valid, monitor_emit_registers(pid, pc, sp).
-    //         Retornar idx.
+        if (arg != NULL) {
+            execl(path, path, arg, (char *)NULL);
+        } else {
+            execl(path, path, (char *)NULL);
+        }
+        perror("execl");
+        _exit(1);
+    }
+    child_created = 1;
 
-    (void)path; (void)arg;  // silence unused warnings while unimplemented
-    return -1;  // TODO: reemplazar por idx real
+    if (platform_uses_ptrace()) {
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited == -1 && errno == EINTR);
+
+        if (waited == -1) {
+            perror("waitpid");
+            goto cleanup;
+        }
+        if (!WIFSTOPPED(status)) {
+            fprintf(stderr, "Error: el proceso no se detuvo tras exec.\n");
+            goto cleanup;
+        }
+    }
+
+    pcb_init(&process_table[idx], pid, short_name);
+    process_table[idx].last_started = process_table[idx].created_at;
+
+    if (platform_uses_ptrace()) {
+        if (platform_get_registers(pid, &process_table[idx].registers) == 0) {
+            process_table[idx].regs_valid = 1;
+        }
+        if (platform_detach(pid) == -1) {
+            perror("platform_detach");
+            goto cleanup;
+        }
+    }
+
+    if (platform_stop_process(pid) == -1) {
+        perror("SIGSTOP");
+        goto cleanup;
+    }
+
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, WUNTRACED);
+    } while (waited == -1 && errno == EINTR);
+
+    if (waited == -1) {
+        perror("waitpid");
+        goto cleanup;
+    }
+    if (!WIFSTOPPED(status)) {
+        fprintf(stderr, "Error: el proceso terminó antes de quedar detenido.\n");
+        goto cleanup;
+    }
+
+    process_table[idx].state = PROC_READY;
+    if (rq_enqueue(idx) == -1) {
+        fprintf(stderr, "Error: no se pudo agregar el proceso a la ready queue.\n");
+        goto cleanup;
+    }
+
+    process_count++;
+    monitor_emit_created(pid, process_table[idx].name);
+    if (process_table[idx].regs_valid) {
+        monitor_emit_registers(
+            pid,
+            (unsigned long long)process_table[idx].registers.program_counter,
+            (unsigned long long)process_table[idx].registers.stack_pointer
+        );
+    }
+    result = idx;
+
+cleanup:
+    if (result == -1 && child_created) {
+        if (kill(pid, SIGKILL) == -1 && errno != ESRCH) {
+            perror("kill");
+        }
+
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited == -1 && errno == EINTR);
+        if (waited == -1 && errno != ECHILD) {
+            perror("waitpid");
+        }
+    }
+
+    if (restore_signal_mask(&previous_mask) == -1) {
+        perror("sigprocmask");
+    }
+    free(path_copy);
+    return result;
 }
 
 
@@ -170,24 +329,43 @@ int scheduler_create_process(const char *path, const char *arg) {
 // proceso empieza a producir salida en la terminal.
 // ============================================================
 void scheduler_start(int slice_ms) {
-    // Paso 1. Si rq_is_empty(), imprimir "No hay procesos en la ready queue."
-    //         y retornar.
+    if (scheduler_active || current_running >= 0) {
+        return;
+    }
+    if (rq_is_empty()) {
+        fprintf(stderr, "No hay procesos en la ready queue.\n");
+        return;
+    }
 
-    // Paso 2. Desencolar el primer índice con rq_dequeue().
+    int idx = rq_dequeue();
+    if (idx < 0 || idx >= process_count ||
+        process_table[idx].state != PROC_READY) {
+        fprintf(stderr, "Error: entrada inválida en la ready queue.\n");
+        return;
+    }
 
-    // Paso 3. Actualizar PCB del proceso entrante:
-    //         - process_table[idx].state = PROC_RUNNING;
-    //         - clock_gettime(CLOCK_MONOTONIC, &process_table[idx].last_started);
-    //         - current_running = idx;
+    pcb_t *next = &process_table[idx];
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        perror("clock_gettime");
+        rq_enqueue(idx);
+        return;
+    }
 
-    // Paso 4. Reanudar el proceso con platform_resume_process(process_table[idx].pid).
+    next->wait_time_ms += timespec_diff_ms(now, next->last_started);
+    next->last_started = now;
+    next->state = PROC_RUNNING;
+    if (platform_resume_process(next->pid) == -1) {
+        perror("SIGCONT");
+        next->state = PROC_READY;
+        rq_enqueue(idx);
+        return;
+    }
 
-    // Paso 5. Activar el scheduler y arrancar el timer:
-    //         - scheduler_active = 1;
-    //         - timer_init(slice_ms, scheduler_tick);  // registra el handler
-    //         - timer_start();                         // arranca setitimer
-
-    (void)slice_ms;  // silence unused while unimplemented
+    current_running = idx;
+    scheduler_active = 1;
+    timer_init(slice_ms, scheduler_tick);
+    timer_start();
 }
 
 
@@ -209,36 +387,79 @@ void scheduler_start(int slice_ms) {
 // ============================================================
 void scheduler_tick(int signum) {
     (void)signum;
+    sigset_t previous_mask;
+    if (block_scheduler_signals(&previous_mask) == -1) {
+        static const char message[] = "miniOS: unable to block scheduler signals\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        return;
+    }
 
-    // Paso 1. Salida temprana: si current_running < 0 o !scheduler_active, return.
+    int running_idx = current_running;
+    if (!scheduler_active || running_idx < 0 || running_idx >= process_count) {
+        goto done;
+    }
 
-    // Paso 2. Obtener puntero al PCB del proceso actual:
-    //         pcb_t *current = &process_table[current_running];
+    pcb_t *current = &process_table[running_idx];
+    pid_t from_pid = current->pid;
 
-    // Paso 3. Detener el proceso actual con platform_stop_process(current->pid).
+    if (current->state == PROC_TERMINATED) {
+        current_running = -1;
+        int next_idx = dispatch_next_process();
+        if (next_idx >= 0) {
+            monitor_emit_switch(from_pid, process_table[next_idx].pid,
+                                timer_get_slice());
+        }
+        goto done;
+    }
 
-    // Paso 4. Actualizar PCB del saliente:
-    //         - Obtener tiempo actual con clock_gettime(CLOCK_MONOTONIC, &now).
-    //         - Calcular elapsed = timespec_diff_ms(now, current->last_started).
-    //         - current->cpu_time_ms += elapsed;
-    //         - current->state = PROC_READY;
-    //         - current->context_switches++;
+    if (platform_stop_process(current->pid) == -1) {
+        if (errno != ESRCH) {
+            static const char message[] = "miniOS: failed to stop the running process\n";
+            write(STDERR_FILENO, message, sizeof(message) - 1);
+            goto done;
+        }
+        current->state = PROC_TERMINATED;
+        monitor_emit_terminated(current->pid, current->cpu_time_ms,
+                                current->context_switches);
+        current_running = -1;
+        int next_idx = dispatch_next_process();
+        if (next_idx >= 0) {
+            monitor_emit_switch(from_pid, process_table[next_idx].pid,
+                                timer_get_slice());
+        }
+        goto done;
+    }
 
-    // Paso 5. Encolar el proceso saliente con rq_enqueue(current_running).
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        static const char message[] = "miniOS: clock_gettime failed in scheduler tick\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        goto done;
+    }
 
-    // Paso 6. Si la cola quedó vacía (rq_is_empty()):
-    //         - current_running = -1;
-    //         - timer_stop();
-    //         - return;
+    current->cpu_time_ms += timespec_diff_ms(now, current->last_started);
+    current->last_started = now;
+    current->state = PROC_READY;
+    current->context_switches++;
+    if (rq_enqueue(running_idx) == -1) {
+        static const char message[] = "miniOS: ready queue is full\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        current->state = PROC_RUNNING;
+        goto done;
+    }
 
-    // Paso 7. Desencolar el siguiente, actualizar su PCB y reanudarlo:
-    //         - int next_idx = rq_dequeue();
-    //         - pcb_t *next = &process_table[next_idx];
-    //         - next->state = PROC_RUNNING;
-    //         - clock_gettime(CLOCK_MONOTONIC, &next->last_started);
-    //         - platform_resume_process(next->pid);
-    //         - monitor_emit_switch(current->pid, next->pid, timer_get_slice());
-    //         - current_running = next_idx;
+    current_running = -1;
+    int next_idx = dispatch_next_process();
+    if (next_idx >= 0) {
+        monitor_emit_switch(from_pid, process_table[next_idx].pid,
+                            timer_get_slice());
+    }
+
+done:
+    if (restore_signal_mask(&previous_mask) == -1) {
+        static const char message[] = "miniOS: unable to restore signal mask\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+    }
 }
 
 
@@ -256,29 +477,77 @@ void scheduler_tick(int signum) {
 // ============================================================
 void scheduler_sigchld(int signum) {
     (void)signum;
+    sigset_t previous_mask;
+    if (block_scheduler_signals(&previous_mask) == -1) {
+        static const char message[] = "miniOS: unable to block scheduler signals\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        return;
+    }
 
-    // Paso 1. Loop while waitpid(-1, &status, WNOHANG | WUNTRACED) > 0:
-    //         - WNOHANG para no bloquear.
-    //         - El loop recoge todos los hijos terminados pendientes.
+    for (;;) {
+        int status = 0;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid == 0) {
+            break;
+        }
+        if (pid == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != ECHILD) {
+                static const char message[] = "miniOS: waitpid failed in SIGCHLD handler\n";
+                write(STDERR_FILENO, message, sizeof(message) - 1);
+            }
+            break;
+        }
+        if (!WIFEXITED(status) && !WIFSIGNALED(status)) {
+            continue;
+        }
 
-    // Paso 2. Dentro del loop, IGNORAR paradas: si !WIFEXITED(status) y
-    //         !WIFSIGNALED(status), continue (el proceso solo se detuvo,
-    //         no terminó).
+        int idx;
+        for (idx = 0; idx < process_count; idx++) {
+            if (process_table[idx].pid == pid) {
+                break;
+            }
+        }
+        if (idx == process_count) {
+            continue;
+        }
 
-    // Paso 3. Buscar el PID en process_table (loop por los process_count).
-    //         Ignorar si ya está PROC_TERMINATED.
+        pcb_t *finished = &process_table[idx];
+        int was_running = (idx == current_running);
+        int already_terminated = (finished->state == PROC_TERMINATED);
 
-    // Paso 4. Marcar process_table[i].state = PROC_TERMINATED y
-    //         llamar monitor_emit_terminated(pid, cpu_time_ms, context_switches).
+        if (was_running && !already_terminated) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                finished->cpu_time_ms += timespec_diff_ms(now, finished->last_started);
+            } else {
+                static const char message[] = "miniOS: clock_gettime failed in SIGCHLD handler\n";
+                write(STDERR_FILENO, message, sizeof(message) - 1);
+            }
+        }
 
-    // Paso 5. Si i == current_running (el que terminó era el que corría):
-    //         a) Actualizar cpu_time_ms con el elapsed desde last_started.
-    //         b) current_running = -1;
-    //         c) Si !rq_is_empty(): desencolar siguiente, marcarlo RUNNING,
-    //            registrar last_started y platform_resume_process.
-    //            Luego current_running = next.
-    //         d) Si rq_is_empty(): timer_stop(); scheduler_active = 0;
+        if (!already_terminated) {
+            finished->state = PROC_TERMINATED;
+            monitor_emit_terminated(pid, finished->cpu_time_ms,
+                                    finished->context_switches);
+        }
 
-    // Paso 6. Si i != current_running (estaba en la cola esperando):
-    //         rq_remove(i);
+        if (was_running) {
+            current_running = -1;
+            int next_idx = dispatch_next_process();
+            if (next_idx >= 0) {
+                monitor_emit_switch(pid, process_table[next_idx].pid,
+                                    timer_get_slice());
+            }
+        } else {
+            rq_remove(idx);
+        }
+    }
+
+    if (restore_signal_mask(&previous_mask) == -1) {
+        static const char message[] = "miniOS: unable to restore signal mask\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+    }
 }

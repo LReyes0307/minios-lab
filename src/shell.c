@@ -38,6 +38,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <errno.h>
+#include <limits.h>
 
 #define MAX_LINE 256
 
@@ -209,7 +211,21 @@ static void cmd_run(const char *path, const char *arg) {
     //         arrancar el scheduler con timer_get_slice() como slice:
     //         scheduler_start(timer_get_slice());
 
-    (void)path; (void)arg;  // silence unused while unimplemented
+    if (path == NULL || path[0] == '\0') {
+        printf("Uso: run <binario> [argumento]\n");
+        return;
+    }
+    if (access(path, X_OK) == -1) {
+        perror(path);
+        return;
+    }
+
+    if (scheduler_create_process(path, arg) < 0) {
+        return;
+    }
+    if (!scheduler_is_running()) {
+        scheduler_start(timer_get_slice());
+    }
 }
 
 
@@ -230,20 +246,18 @@ static void cmd_run(const char *path, const char *arg) {
 // rq_print() (que imprime algo como "Ready Queue: PID 1235 -> PID 1234").
 // ============================================================
 static void cmd_ps(void) {
-    // Paso 1. block_alarm() para proteger la lectura de process_table.
+    block_alarm();
+    if (process_count == 0) {
+        printf("No hay procesos.\n");
+        unblock_alarm();
+        return;
+    }
 
-    // Paso 2. Si process_count == 0: imprimir "No hay procesos." y retornar
-    //         (recuerda hacer unblock_alarm antes de retornar!).
-
-    // Paso 3. Imprimir un salto de linea + llamar pcb_print_table().
-
-    // Paso 4. Imprimir otro salto de linea + llamar rq_print().
-
-    // Paso 5. unblock_alarm() al terminar.
-    //
-    // Pista: puedes implementar esto desde cero con tu propio formato
-    // si prefieres. Los campos del PCB estan en pcb_t (ver pcb.h):
-    //   pid, name, state, cpu_time_ms, wait_time_ms, context_switches
+    printf("\n");
+    pcb_print_table();
+    printf("\n");
+    rq_print();
+    unblock_alarm();
 }
 
 
@@ -279,7 +293,59 @@ static void cmd_kill_proc(const char *arg) {
 
     // Paso 6. unblock_alarm() al terminar.
 
-    (void)arg;  // silence unused while unimplemented
+    if (arg == NULL || arg[0] == '\0') {
+        printf("Uso: kill <pid>\n");
+        return;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long parsed_pid = strtol(arg, &end, 10);
+    if (errno == ERANGE || end == arg || *end != '\0' ||
+        parsed_pid <= 0 || parsed_pid > INT_MAX) {
+        printf("PID inválido: '%s'\n", arg);
+        return;
+    }
+
+    pid_t target_pid = (pid_t)parsed_pid;
+    block_alarm();
+
+    int found = 0;
+    for (int i = 0; i < process_count; i++) {
+        pcb_t *pcb = &process_table[i];
+        if (pcb->pid != target_pid || pcb->state == PROC_TERMINATED) {
+            continue;
+        }
+
+        found = 1;
+        if (kill(target_pid, SIGKILL) == -1) {
+            perror("kill");
+            break;
+        }
+
+        if (i == scheduler_get_running()) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+                perror("clock_gettime");
+            } else {
+                pcb->cpu_time_ms += timespec_diff_ms(now, pcb->last_started);
+            }
+        } else {
+            rq_remove(i);
+        }
+
+        pcb->state = PROC_TERMINATED;
+        monitor_emit_terminated(pcb->pid, pcb->cpu_time_ms,
+                                pcb->context_switches);
+        printf("Proceso PID %d terminado.\n", (int)target_pid);
+        break;
+    }
+
+    if (!found) {
+        printf("Proceso PID %d no encontrado o ya terminado.\n",
+               (int)target_pid);
+    }
+    unblock_alarm();
 }
 
 
@@ -305,25 +371,42 @@ static void cmd_kill_proc(const char *arg) {
 //     Avg espera:            230.5 ms
 // ============================================================
 static void cmd_stats(void) {
-    // Paso 1. block_alarm() para proteger la lectura.
+    block_alarm();
 
-    // Paso 2. Declarar acumuladores:
-    //         int active = 0, terminated = 0;
-    //         double total_cpu = 0, total_wait = 0;
-    //         int total_switches = 0;
+    int active = 0;
+    int terminated = 0;
+    int total_switches = 0;
+    double total_cpu = 0.0;
+    double total_wait = 0.0;
 
-    // Paso 3. Recorrer process_table sumando:
-    //         - Si state == PROC_TERMINATED: terminated++;  else active++;
-    //         - total_cpu += process_table[i].cpu_time_ms;
-    //         - total_wait += process_table[i].wait_time_ms;
-    //         - total_switches += process_table[i].context_switches;
+    for (int i = 0; i < process_count; i++) {
+        const pcb_t *pcb = &process_table[i];
+        if (pcb->state == PROC_TERMINATED) {
+            terminated++;
+        } else {
+            active++;
+        }
+        total_cpu += pcb->cpu_time_ms;
+        total_wait += pcb->wait_time_ms;
+        total_switches += pcb->context_switches;
+    }
 
-    // Paso 4. Imprimir las estadisticas con los campos arriba.
-    //         Usar timer_get_slice() para el slice actual.
-    //         Si process_count > 0, imprimir tambien los promedios
-    //         (total_cpu / process_count) y (total_wait / process_count).
-
-    // Paso 5. unblock_alarm().
+    printf("\n=== Estadísticas del Scheduler ===\n");
+    printf("  Procesos activos:      %d\n", active);
+    printf("  Procesos terminados:   %d\n", terminated);
+    printf("  Time slice actual:     %d ms\n", timer_get_slice());
+    printf("  CPU total acumulado:   %.1f ms\n", total_cpu);
+    printf("  Context switches:      %d\n", total_switches);
+    if (process_count > 0) {
+        printf("  Avg CPU por proceso:   %.1f ms\n",
+               total_cpu / process_count);
+        printf("  Avg espera:            %.1f ms\n",
+               total_wait / process_count);
+    } else {
+        printf("  Avg CPU por proceso:   N/A\n");
+        printf("  Avg espera:            N/A\n");
+    }
+    unblock_alarm();
 }
 
 
@@ -336,6 +419,7 @@ void shell_run(void) {
     // Setup alarm mask for sigprocmask
     sigemptyset(&alarm_mask);
     sigaddset(&alarm_mask, SIGALRM);
+    sigaddset(&alarm_mask, SIGCHLD);
 
     printf("+----------------------------------+\n");
     printf("|       miniOS v1.0                |\n");
